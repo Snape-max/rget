@@ -10,30 +10,25 @@ use futures::future;
 use http::StatusCode;
 use colored::*;
 use std::fmt::Write;
-use std::sync::Arc;
+use lazy_static::lazy_static;
+use std::sync::Mutex;
+use std::process;
 
-// 自定义结构体，用于管理临时文件的清理
-struct TempFileGuard {
-    path: PathBuf,
-}
-
-impl TempFileGuard {
-    fn new(path: PathBuf) -> Self {
-        Self { path }
-    }
-}
-
-impl Drop for TempFileGuard {
-    fn drop(&mut self) {
-        if self.path.exists() {
-            println!("Cleaning up temporary file: {}", self.path.display());
-            let _ = std::fs::remove_file(&self.path);
-        }
-    }
+lazy_static! {
+    // 全局临时文件列表
+    static ref TEMP_FILES: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
 }
 
 #[tokio::main]
 async fn main() {
+    // 注册一个 Ctrl+C 信号处理函数
+    tokio::spawn(async {
+        tokio::signal::ctrl_c().await.unwrap();
+        log_info("Received interrupt signal, cleaning up...");
+        cleanup_temp_files();
+        process::exit(1);
+    });
+
     let matches = Command::new("Rget")
         .version("1.0")
         .author("by Luke Mars")
@@ -133,6 +128,7 @@ async fn main() {
     let mut futures = Vec::new();
     for i in 0..chunks {
         let temp_path = temp_dir.join(format!("{}.part{}", output_file.file_name().unwrap().to_string_lossy(), i));
+        register_temp_file(temp_path.clone()); // 注册临时文件
         let pb = multi_progress.add(ProgressBar::new(chunk_size));
         pb.set_style(
             ProgressStyle::with_template("{spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {bytes}/{total_bytes} ({eta})")
@@ -141,20 +137,7 @@ async fn main() {
                 .progress_chars("#>-"),
         );
         pb.set_message(format!("Chunk {}", i));
-
-        // 创建 TempFileGuard 来管理临时文件
-        let temp_file_guard = Arc::new(TempFileGuard::new(temp_path.clone()));
-        let client = client.clone();
-        let url = url.to_string();
-        let temp_file_guard_clone = Arc::clone(&temp_file_guard);
-
-        let chunk_future = async move {
-            if let Err(e) = download_chunk(&client, &url, i, chunk_size, total_size, chunks, temp_path.clone(), pb).await {
-                log_error(&format!("Failed to download chunk {}: {}", i, e));
-            }
-            // 如果下载成功，手动忘记 TempFileGuard，避免删除临时文件
-            Arc::into_inner(temp_file_guard_clone).unwrap();
-        };
+        let chunk_future = download_chunk(&client, url, i, chunk_size, total_size, chunks, temp_path, pb);
         futures.push(chunk_future);
     }
 
@@ -173,12 +156,13 @@ async fn main() {
         file.read_to_end(&mut buffer).await.unwrap();
         output_file_handle.write_all(&buffer).await.unwrap();
         fs::remove_file(&temp_path).await.unwrap();
+        unregister_temp_file(temp_path); // 取消注册已清理的临时文件
     }
 
     log_success(&format!("Download complete: {}", output_file.display()));
 }
 
-async fn download_chunk(client: &Client, url: &str, chunk_index: u64, chunk_size: u64, total_size: u64, chunks: u64, temp_path: PathBuf, pb: ProgressBar) -> Result<(), Box<dyn std::error::Error>> {
+async fn download_chunk(client: &Client, url: &str, chunk_index: u64, chunk_size: u64, total_size: u64, chunks: u64, temp_path: PathBuf, pb: ProgressBar) {
     let start = chunk_index * chunk_size;
     let end = if chunk_index == chunks - 1 {
         total_size - 1
@@ -192,25 +176,60 @@ async fn download_chunk(client: &Client, url: &str, chunk_index: u64, chunk_size
         match client.get(url).header("Range", range_header.clone()).send().await {
             Ok(mut response) => {
                 if response.status().is_success() {
-                    let mut file = File::create(&temp_path).await?;
+                    let mut file = match File::create(&temp_path).await {
+                        Ok(f) => f,
+                        Err(e) => {
+                            log_error(&format!("Failed to create file {}: {}", temp_path.display(), e));
+                            break;
+                        }
+                    };
                     let mut downloaded: u64 = 0;
-                    while let Some(chunk) = response.chunk().await? {
-                        file.write_all(&chunk).await?;
+                    while let Some(chunk) = response.chunk().await.unwrap() {
+                        if let Err(e) = file.write_all(&chunk).await {
+                            log_error(&format!("Failed to write to file {}: {}", temp_path.display(), e));
+                            break;
+                        }
                         downloaded += chunk.len() as u64;
                         pb.set_position(downloaded);
                     }
                     pb.finish_with_message("done");
-                    return Ok(());
+                    break;
                 } else {
-                    return Err(format!("Failed to download chunk {}: {}", chunk_index, response.status()).into());
+                    log_error(&format!("Failed to download chunk {}: {}", chunk_index, response.status()));
                 }
             },
-            Err(_e) => {
-                if retry_count == 0 {
-                    return Err(format!("Failed to download chunk {}, giving up.", chunk_index).into());
-                }
+            Err(e) => {
+                log_error(&format!("Connection failed: {}, retrying...", e));
                 retry_count -= 1;
+                if retry_count == 0 {
+                    log_error(&format!("Failed to download chunk {}, giving up.", chunk_index));
+                    break;
+                }
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
+        }
+    }
+}
+
+// 注册临时文件
+fn register_temp_file(path: PathBuf) {
+    TEMP_FILES.lock().unwrap().push(path);
+}
+
+// 取消注册临时文件
+fn unregister_temp_file(path: PathBuf) {
+    TEMP_FILES.lock().unwrap().retain(|p| p != &path);
+}
+
+// 清理所有临时文件
+fn cleanup_temp_files() {
+    let temp_files = TEMP_FILES.lock().unwrap();
+    for path in temp_files.iter() {
+        if path.exists() {
+            if let Err(e) = std::fs::remove_file(path) {
+                log_error(&format!("Failed to clean up temp file {}: {}", path.display(), e));
+            } else {
+                log_info(&format!("Cleaned up temp file: {}", path.display()));
             }
         }
     }
