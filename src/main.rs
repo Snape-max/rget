@@ -72,6 +72,8 @@ async fn main() {
     log_info("Resolving host...");
     let head_response = client.head(url).send().await;
     let mut total_size: u64 = 0;
+    let mut supports_range = false;
+
     match head_response {
         Ok(resp) if resp.status() == StatusCode::OK => {
             if let Some(content_length) = resp.headers().get("Content-Length") {
@@ -91,6 +93,13 @@ async fn main() {
                 log_warning("No Content-Length in HEAD response, trying Range request...");
                 // Fallback to Range request
             }
+
+            // Check if server supports Range requests
+            if let Some(accept_ranges) = resp.headers().get("Accept-Ranges") {
+                if accept_ranges == "bytes" {
+                    supports_range = true;
+                }
+            }
         },
         Ok(_) => {
             log_warning("No Content-Length in HEAD response, trying Range request...");
@@ -102,12 +111,46 @@ async fn main() {
         },
     }
 
-    // Proceed with chunked download if total_size is known
-    if total_size == 0 {
-        log_error("Unable to determine file size. Chunked download not possible.");
+    // If server doesn't support Range requests or Content-Length is missing, fallback to single-threaded download
+    if !supports_range || total_size == 0 {
+        log_info("File size unknown, falling back to single-threaded download.");
+        let output_file = if let Some(output_path) = output {
+            output_path
+        } else {
+            let url_parsed = Url::parse(url).unwrap();
+            let path = url_parsed.path();
+            let default_file_name = path.rsplit('/').next().unwrap().to_string();
+            env::current_dir().unwrap().join(&default_file_name)
+        };
+
+        let pb = ProgressBar::new_spinner();
+        pb.set_style(
+            ProgressStyle::with_template("{spinner:.green} [{elapsed_precise}] {msg}")
+                .unwrap()
+                .tick_chars("⠁⠂⠄⡀⢀⠠⠐⠈ "),
+        );
+        pb.set_message("Downloading...");
+
+        let mut file = File::create(&output_file).await.unwrap();
+        let mut response = client.get(url).send().await.unwrap();
+
+        let mut downloaded: u64 = 0;
+        while let Some(chunk) = response.chunk().await.unwrap() {
+            if let Err(e) = file.write_all(&chunk).await {
+                log_error(&format!("Failed to write to file {}: {}", output_file.display(), e));
+                break;
+            }
+            downloaded += chunk.len() as u64;
+            pb.set_message(format!("Downloaded {} bytes", downloaded));
+            pb.tick();
+        }
+
+        pb.finish_with_message("done");
+        log_success(&format!("Download complete: {}", output_file.display()));
         return;
     }
 
+    // Proceed with chunked download if total_size is known and server supports Range requests
     let chunk_size = (total_size + chunks - 1) / chunks;
 
     let output_file = if let Some(output_path) = output {
