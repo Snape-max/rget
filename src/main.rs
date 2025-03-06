@@ -13,6 +13,8 @@ use std::process;
 use lazy_static::lazy_static;
 use std::sync::Mutex;
 use futures::StreamExt;
+use std::time::Instant;
+use bytesize::ByteSize;
 
 lazy_static! {
     static ref TEMP_FILES: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
@@ -70,16 +72,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     match check_download_capabilities(&client, url).await {
         Ok((supports_range, total_size)) => {
+            let output_file = get_output_file(output.clone(), url);
+            log_info(&format!("Downloading from: {}", url));
+            log_info(&format!("Saving to: {}", output_file.display()));
             if !supports_range || total_size == 0 || chunks == 1 {
                 log_info("Using single-threaded download");
-                let output_file = get_output_file(output.clone(), url);
                 single_threaded_download(&client, url, output_file).await;
                 return Ok(());
             }
-
             let chunk_size = (total_size + chunks - 1) / chunks;
-            let output_file = get_output_file(output, url);
+            // let output_file = get_output_file(output, url);
             let temp_dir = env::temp_dir();
+            log_info(&format!("Saving temp files to: {}", temp_dir.display()));
             let multi_progress = MultiProgress::new();
 
             log_info(&format!("Downloading in {} chunks...", chunks));
@@ -279,30 +283,71 @@ async fn download_chunk(
     let mut retry_count = 5;
     let mut backoff = 1;
 
+    // 速度跟踪变量
+    let started = Instant::now();
+    let mut last_update = started;
+    let mut last_downloaded = 0;
+
     while retry_count > 0 {
         match client.get(url)
             .header("Range", range_header.clone())
             .send()
             .await
         {
-            Ok(mut response) if response.status().is_success() => {
-                let mut file = match File::create(&temp_path).await {
+            Ok(response) if response.status().is_success() => {
+                // 支持断点续传的文件打开方式
+                let mut file = match File::options()
+                    .create(true)
+                    .append(true)
+                    .open(&temp_path)
+                    .await
+                {
                     Ok(f) => f,
                     Err(e) => {
                         log_error(&format!("Failed to create temp file: {}", e));
                         return;
                     }
                 };
+
+                // 获取已下载位置
+                let current_size = file.metadata().await.unwrap().len();
+                pb.set_position(current_size);
                 
-                let mut downloaded: u64 = 0;
-                while let Ok(Some(chunk)) = response.chunk().await {
-                    if let Err(e) = file.write_all(&chunk).await {
+                let mut stream = response.bytes_stream();
+                let mut downloaded = current_size;
+
+                while let Some(chunk) = stream.next().await {
+                    let bytes = match chunk {
+                        Ok(b) => b,
+                        Err(e) => {
+                            log_error(&format!("Download failed: {}", e));
+                            break;
+                        }
+                    };
+
+                    if let Err(e) = file.write_all(&bytes).await {
                         log_error(&format!("Write failed: {}", e));
                         break;
                     }
-                    downloaded += chunk.len() as u64;
+
+                    downloaded += bytes.len() as u64;
                     pb.set_position(downloaded);
+
+                    // 更新瞬时速度
+                    let now = Instant::now();
+                    let duration_since_last = now.duration_since(last_update).as_secs_f64();
+                    if duration_since_last >= 0.5 { // 每500ms更新一次
+                        let current_speed = (downloaded - last_downloaded) as f64 / duration_since_last;
+                        pb.set_message(format!(
+                            "Chunk {} | Speed: {}/s",
+                            chunk_index,
+                            ByteSize::kb(current_speed as u64 / 1024)
+                        ));
+                        last_update = now;
+                        last_downloaded = downloaded;
+                    }
                 }
+                
                 pb.finish_with_message("done");
                 return;
             },
@@ -328,7 +373,6 @@ async fn download_chunk(
             tokio::time::sleep(Duration::from_secs(backoff)).await;
             backoff = std::cmp::min(backoff * 2, 30);
         } else {
-            log_error(&format!("Failed to download chunk {}", chunk_index));
             pb.abandon_with_message("failed");
         }
     }
@@ -336,12 +380,31 @@ async fn download_chunk(
 
 fn setup_progress_bar(pb: &ProgressBar, chunk_index: u64) {
     pb.set_style(
-        ProgressStyle::with_template("{spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {bytes}/{total_bytes} ({eta}) ")
-            .unwrap()
-            .with_key("eta", |state: &ProgressState, w: &mut dyn std::fmt::Write| {
-                write!(w, "{:.1}s", state.eta().as_secs_f64()).unwrap()
-            })
-            .progress_chars("#>-"),
+        ProgressStyle::with_template(
+            "{spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {bytes}/{total_bytes} ({eta})  {speed} (avg: {avg_speed})"
+        )
+        .unwrap()
+        .with_key("speed", |state: &ProgressState, w: &mut dyn std::fmt::Write| {
+            // 计算瞬时速度（过去500ms）
+            let elapsed = state.elapsed().as_secs_f64();
+            if elapsed > 0.0 {
+                let speed = state.pos() as f64 / elapsed;
+                write!(w, "{}/s", ByteSize::kb(speed as u64 / 1024)).unwrap();
+            } else {
+                write!(w, "-").unwrap();
+            }
+        })
+        .with_key("avg_speed", |state: &ProgressState, w: &mut dyn std::fmt::Write| {
+            // 计算全程平均速度
+            let total_time = state.elapsed().as_secs_f64();
+            if total_time > 0.0 {
+                let avg_speed = state.pos() as f64 / total_time;
+                write!(w, "{}/s", ByteSize::kb(avg_speed as u64 / 1024)).unwrap();
+            } else {
+                write!(w, "-").unwrap();
+            }
+        })
+        .progress_chars("#>-"),
     );
     pb.set_message(format!("Chunk {}", chunk_index));
 }
